@@ -98,9 +98,24 @@ Aucune visibilité transversale sur « qui est où, quand ». Les occasions de r
 ### Définition d'un match
 Deux trajets « matchent » si :
 1. **Même ville** de destination (normalisée), et
-2. **Chevauchement de dates** : `trajetA.dateDébut ≤ trajetB.dateFin` ET `trajetB.dateDébut ≤ trajetA.dateFin`, et
+2. **Chevauchement de dates** : `trajetA.dateDébut ≤ trajetB.dateFin` ET `trajetB.dateDébut ≤ trajetA.dateFin`, **comparées dans le fuseau horaire de la ville de destination** (voir ci-dessous), et
 3. Les **deux** trajets sont en visibilité « matchable », et
 4. Les périmètres de visibilité des deux personnes sont mutuellement compatibles.
+
+### Fuseaux horaires (point critique en contexte mondial)
+Avec des collaborateurs et des destinations répartis sur plusieurs régions, comparer des dates « brutes » est piégeux : une même journée civile ne couvre pas le même intervalle absolu selon le fuseau, et un trajet saisi par un employé à Tokyo ne doit pas être décalé d'un jour par rapport à un trajet saisi pour la même ville par un employé à San Francisco.
+
+**Principe retenu : le fuseau de référence d'un trajet est celui de sa ville de destination.** Deux personnes qui se croisent sont, par définition, dans la même ville — donc dans le même fuseau. On ancre donc les dates sur le lieu de la rencontre, pas sur le fuseau de saisie de chacun.
+
+Concrètement :
+- Le référentiel `City` porte le **fuseau IANA** de la ville (ex. `Europe/Paris`, `America/New_York`, `Asia/Tokyo`).
+- Les dates d'un trajet (`date_start`, `date_end`) sont interprétées comme des **dates locales à la ville de destination**. Une journée « du 12 au 14 mars à Lisbonne » signifie `2026-03-12T00:00` → `2026-03-14T23:59:59` dans `Europe/Lisbon`.
+- Pour le calcul et le stockage, on convertit ces bornes en **instants absolus (UTC / `timestamptz`)** via le fuseau de la ville. Le test de chevauchement se fait alors sur des instants UTC comparables, sans ambiguïté.
+- Les changements d'heure (DST) sont gérés automatiquement par la base TZ (PostgreSQL `AT TIME ZONE`), pas à la main.
+
+**Affichage** : les dates et l'éventuelle heure du check-in sont présentées à chaque utilisateur dans le fuseau de la **ville de destination** (« vous serez tous les deux à Berlin ces jours-là »), avec mention explicite du fuseau si nécessaire. On évite de re-convertir vers le fuseau du navigateur, qui n'a pas de sens pour une rencontre sur place.
+
+**Bords de journée** : la frontière « passé / à venir » d'un trajet (purge, statut, notifications « demain ») se calcule aussi dans le fuseau de la ville, pas dans celui du serveur ni du navigateur.
 
 ### Normalisation des villes (point critique)
 Le piège classique : « Paris », « paris », « Paris, FR », « PAR » ne matchent pas en comparaison textuelle naïve.
@@ -108,25 +123,34 @@ Le piège classique : « Paris », « paris », « Paris, FR », « PAR » ne ma
 - un `city_id` canonique (référentiel type GeoNames), **ou**
 - au minimum un couple `(latitude, longitude)` + nom normalisé.
 
+On capture aussi, à ce moment-là, le **fuseau horaire IANA** de la ville (GeoNames le fournit, ou déduction depuis `(lat, lng)`), indispensable au matching multi-régions (voir « Fuseaux horaires » ci-dessous).
+
 Le matching se fait alors sur le `city_id` (exact, indexable, rapide), pas sur le texte.
 
 ### Approche technique du calcul
 - **Déclencheur** : à chaque création/modification de trajet (visibilité = matchable), lancer une requête de recherche des trajets se chevauchant sur le même `city_id`.
-- **Requête** : index composite sur `(city_id, date_start, date_end)`. Le chevauchement de dates est une condition SQL simple et indexable.
+- **Requête** : index composite sur `(city_id, start_at, end_at)` où `start_at`/`end_at` sont des **instants UTC** (`timestamptz`) dérivés des dates locales + fuseau de la ville. Le chevauchement est une condition SQL simple et indexable, et insensible au fuseau de chacun puisqu'elle porte sur des instants absolus.
+- **Normalisation à l'écriture** : on convertit une seule fois, au moment de l'enregistrement, la date locale saisie vers l'instant UTC via le fuseau de la ville (`(:date_start::timestamp) AT TIME ZONE city.timezone`). Le matching travaille ensuite uniquement sur ces instants.
 - À l'échelle de 4 000 personnes, le volume de trajets est faible (quelques dizaines de milliers/an). Pas besoin de moteur complexe : **PostgreSQL suffit largement**. Un job asynchrone (queue) gère la notification pour ne pas bloquer la requête utilisateur.
 
 ### Pseudo-code
 ```sql
+-- start_at / end_at sont des timestamptz (UTC) calculés à l'écriture
+-- à partir de la date locale et du fuseau de la ville de destination :
+--   start_at = (date_start::timestamp) AT TIME ZONE city.timezone
+--   end_at   = ((date_end::timestamp) + interval '1 day' - interval '1 second')
+--              AT TIME ZONE city.timezone
 SELECT t2.*
 FROM trips t2
 WHERE t2.city_id = :new_city_id
   AND t2.user_id <> :new_user_id
   AND t2.visibility = 'matchable'
-  AND t2.date_start <= :new_date_end
-  AND t2.date_end   >= :new_date_start
+  AND t2.start_at <= :new_end_at
+  AND t2.end_at   >= :new_start_at
   -- + filtre de compatibilité des périmètres de visibilité
 ;
 ```
+Comme deux trajets sur la même ville partagent le même fuseau, ce calcul est en pratique équivalent à comparer les dates locales — mais le passage par des instants UTC garantit l'exactitude des bornes de journée (minuit local, DST) et reste cohérent si l'on devait un jour matcher des villes voisines de fuseaux différents.
 
 ### Mise en relation à double consentement
 Un match **ne révèle pas** immédiatement les coordonnées. Flux recommandé :
@@ -238,25 +262,29 @@ City                    -- référentiel normalisé
   country_code
   latitude
   longitude
+  timezone              -- fuseau IANA (ex. 'Europe/Paris'), sert d'ancrage aux dates
 
 Trip
   id (PK)
   user_id (FK -> User)
   city_id (FK -> City)
-  date_start
-  date_end
+  date_start            -- date locale à la ville de destination
+  date_end              -- date locale à la ville de destination
+  start_at              -- timestamptz (UTC) = date_start ancrée au fuseau de la ville
+  end_at                -- timestamptz (UTC) = fin de date_end ancrée au fuseau de la ville
   purpose               -- objet du déplacement (texte court ou enum)
   visibility            -- 'private' | 'matchable'
   presence_status       -- 'declared' | 'checked_in'
   created_at, updated_at
-  -- index: (city_id, date_start, date_end), (user_id)
+  -- index: (city_id, start_at, end_at), (user_id)
+  -- start_at/end_at sont (re)calculés à chaque écriture depuis date_start/date_end + City.timezone
 
 Match
   id (PK)
   trip_a_id (FK -> Trip)
   trip_b_id (FK -> Trip)
   city_id
-  overlap_start, overlap_end
+  overlap_start, overlap_end   -- timestamptz (UTC) ; affichés dans le fuseau de la ville
   status                -- 'suggested' | 'a_accepted' | 'both_accepted' | 'declined'
   created_at
 
@@ -291,6 +319,7 @@ TipVote
 - On ne stocke **jamais** de trace GPS continue.
 - Pour le check-in géo optionnel, on ne conserve que le **résultat** (`is_location_consistent`), pas la latitude/longitude de l'employé.
 - Le consentement est versionné et historisé (`ConsentRecord`).
+- **Tous les instants** (`start_at`, `end_at`, `overlap_*`, `timestamp` des check-ins, `created_at`…) sont stockés en **`timestamptz` (UTC)**. Les dates locales d'un trajet sont ancrées au fuseau de la ville de destination ; jamais au fuseau du serveur ou du navigateur.
 
 ---
 
@@ -360,7 +389,7 @@ TipVote
 ---
 
 ## Récapitulatif des recommandations clés
-- **Matching** : normaliser les villes via geocoding → `city_id`, requête de chevauchement indexée dans PostgreSQL. Inutile de sur-architecturer à cette échelle.
+- **Matching** : normaliser les villes via geocoding → `city_id` (+ fuseau IANA), ancrer les dates de trajet sur le fuseau de la ville de destination, comparer le chevauchement sur des instants UTC (`timestamptz`) indexés dans PostgreSQL. Inutile de sur-architecturer à cette échelle.
 - **Présence** : check-in manuel (retenu) ; prévoir l'option géo one-shot opt-in et le QR/Wi-Fi sans jamais stocker de position brute.
 - **Carte** : MapLibre GL JS + tuiles OSM (fournisseur compatible UE), geocoding séparé.
 - **Stack** : React/TS + Node ou Django + PostgreSQL/PostGIS + cloud managé en UE.
